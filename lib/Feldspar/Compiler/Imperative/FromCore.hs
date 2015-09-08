@@ -43,7 +43,7 @@ module Feldspar.Compiler.Imperative.FromCore (
 
 import qualified Data.Map as Map
 import Data.Char (toLower)
-import Data.List (nub, partition, find, isPrefixOf)
+import Data.List (nub, find, isPrefixOf)
 import Data.Maybe (isJust, fromJust, mapMaybe)
 
 import Control.Monad.RWS
@@ -52,8 +52,8 @@ import Control.Applicative
 
 import Feldspar.Core.Types
 import Feldspar.Core.UntypedRepresentation
-         ( Term(..), Lit(..), collectLetBinders, collectBinders, mkLam
-         , UntypedFeldF(App, LetFun), Fork(..), typeof
+         ( Term(..), Lit(..), collectLetBinders, collectBinders
+         , UntypedFeldF(App, LetFun), Fork(..)
          )
 import qualified Feldspar.Core.UntypedRepresentation as Ut
 import Feldspar.Core.Middleend.FromTyped
@@ -146,10 +146,10 @@ fromCoreExp opt aliases prog = do
     let (ast, s') = flip runState (fromInteger s) $ reifyFeldM (frontendOpts opt) N32 prog
         uast = untype (frontendOpts opt) ast
         mkAlias (Ut.Var i t) = do
-          n <- Map.lookup i aliases
+          n <- Map.lookup (toInteger i) aliases
           return (i, varToExpr $ Rep.Variable (compileTypeRep opt t) n)
         as = mapMaybe mkAlias $ Ut.fv uast
-    let (exp,States s'',results) =
+    let (expr,States s'',results) =
           runRWS (compileExpr (CEnv opt False) uast) (Readers as opt) $ States $ toInteger s'
     put s''
     unless (null (params results)) $ error "fromCoreExp: unexpected params"
@@ -158,7 +158,7 @@ fromCoreExp opt aliases prog = do
     return ( renameEnt  opt x <$> def results
            , renameDecl     x <$> (ls ++ decl results)
            , renameProg opt x p
-           , renameExp x exp
+           , renameExp x expr
            , renameProg opt x <$> epilogue results
            )
 
@@ -239,8 +239,8 @@ compileExprVar env e = do
             assign (Just loc) e'
             return loc
   where isNearlyVar VarExpr{}  = True
-        isNearlyVar (Deref e)  = isNearlyVar e
-        isNearlyVar (AddrOf e) = isNearlyVar e
+        isNearlyVar (Deref a)  = isNearlyVar a
+        isNearlyVar (AddrOf a) = isNearlyVar a
         isNearlyVar _          = False
 
 -- | Compile a function bound by a LetFun.
@@ -256,7 +256,7 @@ compileFunction env loc (coreName, kind, e) | (bs, e') <- collectBinders e = do
         p' <- compileExprVar env {inTask = True } e'
         tellProg [iVarPut loc p']
       Par -> compileProg env {inTask = True} (Just loc) e'
-      Loop | (ix:_) <- es'
+      Loop | (_:_) <- es'
            , Ut.ElementsType{} <- typeof e' -> compileProg env (Just loc) e'
            | (ix:_) <- es' -> compileProg env (Just $ ArrayElem loc ix) e'
       None -> compileProg env (Just loc) e'
@@ -296,7 +296,7 @@ compileProg env (Just loc) (In (App Ut.Parallel _ [len, In (Ut.Lambda (Ut.Var v 
    (ptyp, b) <- case ixf of
           In (App (Ut.Call Loop n) _ vs) -> do
             vs' <- mapM (compileExpr env) vs
-            let mkV v = Rep.Variable (typeof v) (lName v)
+            let mkV w = Rep.Variable (typeof w) (lName w)
                 args  = map (ValueParameter . varToExpr) $ nub $ map mkV vs' ++ fv loc
             return $ (TaskParallel, toBlock $ ProcedureCall n args)
           _                              -> do
@@ -393,7 +393,7 @@ compileProg env (Just loc) (In (App Ut.EparFor _ [len, In (Ut.Lambda (Ut.Var v t
    (ptyp, b) <- case ixf of
           In (App (Ut.Call Loop n) _ vs) -> do
             vs' <- mapM (compileExpr env) vs
-            let mkV v = Rep.Variable (typeof v) (lName v)
+            let mkV w = Rep.Variable (typeof w) (lName w)
                 args  = map (ValueParameter . varToExpr) $ nub $ map mkV vs' ++ fv loc
             return $ (TaskParallel, toBlock $ ProcedureCall n args)
           _                              -> do
@@ -420,7 +420,7 @@ compileProg env loc (In (Ut.Literal a)) = case loc of
      Nothing -> return ()
 -- Logic
 -- Loop
-compileProg env (Just loc) (In (App Ut.ForLoop _ [len, init', In (Ut.Lambda (Ut.Var ix ta) (In (Ut.Lambda (Ut.Var st stt) ixf)))]))
+compileProg env (Just loc) (In (App Ut.ForLoop _ [len, init', In (Ut.Lambda (Ut.Var ix ta) (In (Ut.Lambda (Ut.Var st _) ixf)))]))
   = do
       let ix' = mkVar (compileTypeRep (opts env) ta) ix
       len' <- mkLength env len ta
@@ -431,7 +431,7 @@ compileProg env (Just loc) (In (App Ut.ForLoop _ [len, init', In (Ut.Lambda (Ut.
                           >> shallowCopyWithRefSwap lstate stvar
       tellProg [toProg $ Block ds (for Sequential (lName ix') (litI32 0) len' (litI32 1) (toBlock body))]
       shallowAssign (Just loc) lstate
-compileProg env (Just loc) (In (App Ut.WhileLoop t [init', In (Ut.Lambda (Ut.Var cv ct) cond), In (Ut.Lambda (Ut.Var bv bt) body)])) = do
+compileProg env (Just loc) (In (App Ut.WhileLoop _ [init', In (Ut.Lambda (Ut.Var cv _) cond), In (Ut.Lambda (Ut.Var bv _) body)])) = do
     let condv = mkVar (compileTypeRep (opts env) (typeof cond)) cv
     (lstate,stvar) <- mkDoubleBufferState loc bv
     compileProg env (Just lstate) init'
@@ -767,7 +767,7 @@ compileExpr env (In (App (Ut.Assert msg) _ [cond, a])) = do
 -- Eq
 -- FFI
 -- Floating
-compileExpr _ (In (App Ut.Pi t [])) = error "No pi ready"
+compileExpr _ (In (App Ut.Pi _ [])) = error "No pi ready"
 -- Fractional
 -- Future
 -- Literal
@@ -849,11 +849,11 @@ representableType l
       where t = typeof l
 
 literalConst :: Options -> Ut.Lit -> Constant ()
-literalConst opt LUnit          = IntConst 0 (Rep.NumType Ut.Unsigned Ut.S32)
-literalConst opt (LBool a)      = BoolConst a
-literalConst opt (LInt s sz a)  = IntConst (toInteger a) (Rep.NumType s sz)
-literalConst opt (LFloat a)     = FloatConst a
-literalConst opt (LDouble a)    = DoubleConst a
+literalConst _   LUnit          = IntConst 0 (Rep.NumType Ut.Unsigned Ut.S32)
+literalConst _   (LBool a)      = BoolConst a
+literalConst _   (LInt s sz a)  = IntConst (toInteger a) (Rep.NumType s sz)
+literalConst _   (LFloat a)     = FloatConst a
+literalConst _   (LDouble a)    = DoubleConst a
 literalConst opt (LArray t es)  = ArrayConst (map (literalConst opt) es) $ compileTypeRep opt t
 literalConst opt (LComplex r i) = ComplexConst (literalConst opt r) (literalConst opt i)
 
@@ -1014,7 +1014,7 @@ literalLoc env loc t =
 
 chaseTree :: CompileEnv -> Location -> Ut.UntypedFeld -> Ut.UntypedFeld
             -> CodeWriter [(Pattern (), Block ())]
-chaseTree env loc _s (In (App Ut.Condition _ [In (App Ut.Equal _ [c, a]), t, f]))
+chaseTree env loc _s (In (App Ut.Condition _ [In (App Ut.Equal _ [c, _]), t, f]))
     -- , alphaEq s a -- TODO check that the scrutinees are equal
     = do
          e <- compileExpr env c
